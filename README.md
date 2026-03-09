@@ -780,15 +780,4 @@ For larger tenants, increase `ThrottleDelayMs` if you see sustained throttling.
 - Delegates not present in the mapping CSV are skipped by design.
 - Exported and restored data covers Exchange Online permissions only. It does not migrate mailbox content.
 
-## Publishing checklist
-
-Before publishing this repository to GitHub:
-
-- verify `.gitignore` excludes `.env`, export JSON files, and restore logs
-- confirm no tenant-specific sample files remain in the repository
-- test the examples in this README against the current script versions
-- review `.env.example` and `MailboxMap.example.csv` before publishing so the placeholders match your preferred naming conventions
-
 ## License
-
-Add the license of your choice before publishing if you want the repository to be reusable by others.
