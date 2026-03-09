@@ -2,6 +2,8 @@
 
 PowerShell scripts to export and restore Exchange Online mailbox and folder permissions for tenant-to-tenant migration, remediation, or audit scenarios.
 
+For more information, visit www.candede.com.
+
 This repository contains:
 
 - `Export-ExoPermissions-HybridReady.ps1`: exports mailbox-level and folder-level permissions from a source tenant into a restorable JSON document.
@@ -64,6 +66,32 @@ App-only:
 
 ```powershell
 ./Export-ExoPermissions-HybridReady.ps1 -UseEnvCredentials
+```
+
+Folder permission collection can take a long time in larger tenants because the script has to enumerate folders and read permissions mailbox by mailbox.
+
+If you only need calendar permissions, limit the export to the Calendar folder:
+
+```powershell
+./Export-ExoPermissions-HybridReady.ps1 -IncludedFolders Calendar
+```
+
+If you want to use app-only authentication and only collect Calendar permissions:
+
+```powershell
+./Export-ExoPermissions-HybridReady.ps1 -UseEnvCredentials -IncludedFolders Calendar
+```
+
+If you do not need any folder permissions, skip them entirely to speed up the export:
+
+```powershell
+./Export-ExoPermissions-HybridReady.ps1 -SkipFolderPermissions
+```
+
+You can also limit the export to a small set of folders to reduce runtime, for example:
+
+```powershell
+./Export-ExoPermissions-HybridReady.ps1 -IncludedFolders Calendar,Inbox
 ```
 
 ### 4. Prepare the mailbox mapping CSV
@@ -733,18 +761,20 @@ For larger tenants, increase `ThrottleDelayMs` if you see sustained throttling.
 1. Install or update `ExchangeOnlineManagement`.
 2. Prepare authentication for the source tenant:
    - interactive sign-in, or
-   - `.env` app-only authentication for export
+   - `.env` app-only authentication
 3. Run the export script against the source tenant.
 4. Review the JSON output for scope, unresolvable entries, and export errors.
 5. Build a `SourceUPN` to `TargetUPN` mapping CSV.
-6. Run the restore script with `-WhatIf` against the target tenant.
-7. Review the restore log.
-8. Run the restore again without `-WhatIf`.
+6. Prepare authentication for the target tenant:
+   - interactive sign-in, or
+   - `.env` app-only authentication
+7. Run the restore script with `-WhatIf` against the target tenant.
+8. Review the restore log.
+9. Run the restore again without `-WhatIf`.
 
 ## Known limitations and implementation notes
 
-- `.env` authentication is implemented only in the export script.
-- The restore script currently uses interactive Exchange Online sign-in only.
+- Both scripts support interactive Exchange Online sign-in and `.env` app-only authentication.
 - The scripts rely on Exchange Online cmdlet behavior and RBAC in your tenant; some cmdlets may behave differently depending on service changes or role assignments.
 - Folder permissions are restored by using the folder path recorded in the export. If the corresponding folder structure does not exist in the target mailbox, those entries can fail.
 - Delegates not present in the mapping CSV are skipped by design.
