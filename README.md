@@ -8,17 +8,18 @@ This repository contains:
 
 - `Export-ExoPermissions-HybridReady.ps1`: exports mailbox-level and folder-level permissions from a source tenant into a restorable JSON document.
 - `Restore-ExoPermissions.ps1`: restores supported permissions to a target tenant by using the export JSON and a source-to-target UPN mapping CSV.
+- `Restore-ExoPermissions-OnPrem.ps1`: restores supported permissions to Exchange On-Prem using the same JSON + mapping CSV workflow. When run in Exchange Management Shell, no server parameter is required.
 - `.env.example`: sample app-only authentication file for unattended Exchange Online connections.
 - `MailboxMap.example.csv`: sample UPN mapping file for restore runs.
-
-The export script is designed for both cloud-only and hybrid environments. It records unresolvable trustees instead of failing the entire run, which is useful when source permissions still reference deleted or on-premises-only identities.
 
 ## Features
 
 - Exports mailbox-level and folder-level Exchange Online permissions into a restorable JSON format.
 - Supports both interactive sign-in and app-only `.env` authentication for export and restore.
+- Supports Exchange On-Prem restore without `.env` app authentication, reusing Exchange Management Shell when available.
 - Handles hybrid edge cases by logging unresolvable trustees instead of failing the full run.
 - Supports scoped exports by mailbox type or selected folders.
+- Supports test-scoped export and restore runs by mailbox email list via `-TestMailboxes`.
 - Includes restore dry-run support with `-WhatIf` and action logging to CSV.
 - Supports incremental export saves and resume behavior for long-running collections.
 
@@ -28,16 +29,12 @@ The export script is designed for both cloud-only and hybrid environments. It re
 - [What the scripts capture and restore](#what-the-scripts-capture-and-restore)
 - [Prerequisites](#prerequisites)
 - [Authentication methods](#authentication-methods)
-- [App permissions required for `.env` authentication](#app-permissions-required-for-env-authentication)
 - [Repository files](#repository-files)
 - [Input file formats](#input-file-formats)
-- [Logging and output files](#logging-and-output-files)
 - [How unresolvable permissions are handled](#how-unresolvable-permissions-are-handled)
 - [Throttling and retry behavior](#throttling-and-retry-behavior)
-- [Recommended usage workflow](#recommended-usage-workflow)
 - [Known limitations and implementation notes](#known-limitations-and-implementation-notes)
 - [Publishing checklist](#publishing-checklist)
-- [License](#license)
 
 ## Quick start
 
@@ -47,16 +44,8 @@ The export script is designed for both cloud-only and hybrid environments. It re
 Install-Module ExchangeOnlineManagement -Scope CurrentUser
 ```
 
-### 2. Prepare authentication
-
-Choose one of the following:
-
 - Interactive sign-in: no extra setup beyond having sufficient Exchange Online rights.
 - App-only `.env` authentication: copy `.env.example` to `.env` and fill in `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`, and `ORGANIZATION`.
-
-### 3. Export permissions from the source tenant
-
-Interactive:
 
 ```powershell
 ./Export-ExoPermissions-HybridReady.ps1
@@ -67,8 +56,6 @@ App-only:
 ```powershell
 ./Export-ExoPermissions-HybridReady.ps1 -UseEnvCredentials
 ```
-
-Folder permission collection can take a long time in larger tenants because the script has to enumerate folders and read permissions mailbox by mailbox.
 
 If you only need calendar permissions, limit the export to the Calendar folder:
 
@@ -86,6 +73,12 @@ If you do not need any folder permissions, skip them entirely to speed up the ex
 
 ```powershell
 ./Export-ExoPermissions-HybridReady.ps1 -SkipFolderPermissions
+```
+
+If you want to test with only specific mailboxes, pass a mailbox list:
+
+```powershell
+./Export-ExoPermissions-HybridReady.ps1 -TestMailboxes alice@source.com,bob@source.com
 ```
 
 You can also limit the export to a small set of folders to reduce runtime, for example:
@@ -127,12 +120,50 @@ App-only:
   -WhatIf
 ```
 
+To test restore with only specific mailboxes, combine `-TestMailboxes` with `-WhatIf`:
+
+```powershell
+./Restore-ExoPermissions.ps1 \
+  -ExportJsonPath ./ExoPermissions_20260309_1015.json \
+  -MappingCsvPath ./MailboxMap.csv \
+  -TestMailboxes alice@source.com,bob@source.com \
+  -WhatIf
+```
+
+Exchange On-Prem dry-run in Exchange Management Shell:
+
+```powershell
+./Restore-ExoPermissions-OnPrem.ps1 \
+  -ExportJsonPath ./ExoPermissions_20260309_1015.json \
+  -MappingCsvPath ./MailboxMap.csv \
+  -WhatIf
+```
+
+If Exchange cmdlets are not loaded in the current shell, provide `-ExchangeServer` (or `-ConnectionUri`) so the script can open a remote Exchange session.
+
 ### 6. Run the restore for real
 
 ```powershell
 ./Restore-ExoPermissions.ps1 \
   -ExportJsonPath ./ExoPermissions_20260309_1015.json \
   -MappingCsvPath ./MailboxMap.csv
+```
+
+Exchange On-Prem restore:
+
+```powershell
+./Restore-ExoPermissions-OnPrem.ps1 \
+  -ExportJsonPath ./ExoPermissions_20260309_1015.json \
+  -MappingCsvPath ./MailboxMap.csv
+```
+
+Fallback remote-session example:
+
+```powershell
+./Restore-ExoPermissions-OnPrem.ps1 \
+  -ExportJsonPath ./ExoPermissions_20260309_1015.json \
+  -MappingCsvPath ./MailboxMap.csv \
+  -ExchangeServer ex01.contoso.local
 ```
 
 Review the generated `RestoreLog_*.csv` after each run.
@@ -230,14 +261,14 @@ Before running these scripts in production:
 
 Both scripts support interactive Exchange Online sign-in. This is the default behavior for:
 
-- `Export-ExoPermissions-HybridReady.ps1` when `-UseEnvCredentials` is not supplied
-- `Restore-ExoPermissions.ps1` when `-UseEnvCredentials` is not supplied
+- `Export-ExoPermissions-HybridReady.ps1` when neither `-UseEnvCredentials` nor explicit `-EnvFilePath` is supplied
+- `Restore-ExoPermissions.ps1` when neither `-UseEnvCredentials` nor explicit `-EnvFilePath` is supplied
 
 The basic interactive workflow is shown in the Quick Start section above.
 
 ## `.env` app-only authentication
 
-Both scripts support non-interactive app-only authentication when you pass `-UseEnvCredentials`. Use this for unattended runs, scheduled jobs, or environments where interactive sign-in is not practical.
+Both scripts support non-interactive app-only authentication when you pass `-UseEnvCredentials`. This mode is also auto-enabled if you explicitly pass `-EnvFilePath`. Use this for unattended runs, scheduled jobs, or environments where interactive sign-in is not practical.
 
 In both scripts, this mode is implemented by:
 
@@ -381,7 +412,8 @@ ExoPermissions_yyyyMMdd_HHmm.json
 - Type: `string`
 - Required: No
 - Default: `.env` in the script directory
-- Purpose: custom path to the `.env` file used when `-UseEnvCredentials` is supplied
+- Purpose: custom path to the `.env` file used for app-only authentication
+- Behavior: passing this explicitly auto-enables app-only authentication (equivalent to `-UseEnvCredentials`)
 
 ##### `-RecipientTypeDetails`
 
@@ -597,7 +629,8 @@ RestoreLog_yyyyMMdd_HHmm.csv
 - Type: `string`
 - Required: No
 - Default: `.env` in the script directory
-- Purpose: custom path to the `.env` file used when `-UseEnvCredentials` is supplied
+- Purpose: custom path to the `.env` file used for app-only authentication
+- Behavior: passing this explicitly auto-enables app-only authentication (equivalent to `-UseEnvCredentials`)
 
 #### Restore examples
 

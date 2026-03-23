@@ -46,6 +46,9 @@ param (
     # such as /Calendar or /Inbox/Subfolder.
     [string[]]$IncludedFolders = @(),
 
+    # Optional: only process the specified mailbox email addresses (UPN or PrimarySmtpAddress)
+    [string[]]$TestMailboxes = @(),
+
     # How many ms to sleep between mailboxes to avoid throttling
     [int]$ThrottleDelayMs = 150,
 
@@ -74,6 +77,12 @@ if ([string]::IsNullOrWhiteSpace($EnvFilePath)) {
     $EnvFilePath = Join-Path $scriptDir ".env"
 }
 
+# Convenience behavior: if the caller explicitly passed EnvFilePath, prefer app-only auth.
+if (-not $UseEnvCredentials -and $PSBoundParameters.ContainsKey('EnvFilePath')) {
+    $UseEnvCredentials = $true
+    Write-Host "EnvFilePath was provided explicitly. Enabling app-only authentication." -ForegroundColor Yellow
+}
+
 if ($Resume -and [string]::IsNullOrWhiteSpace($OutputPath)) {
     $latestFile = Get-ChildItem -Path $scriptDir -Filter "ExoPermissions_*.json" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($latestFile) {
@@ -88,6 +97,7 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
 
 Write-Host "`n=== EXO Permission Exporter v$ScriptVersion ===" -ForegroundColor Cyan
 Write-Host "Output : $OutputPath" -ForegroundColor DarkGray
+Write-Host "Auth   : $(if ($UseEnvCredentials) { '.env app-only' } else { 'Interactive' })" -ForegroundColor DarkGray
 Write-Host "Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n" -ForegroundColor DarkGray
 
 # Global identity cache: raw trustee string -> resolved SMTP or $null
@@ -286,6 +296,21 @@ function Normalize-FolderSelector {
 
     if ([string]::IsNullOrWhiteSpace($normalized)) {
         return '/'
+    }
+
+    return $normalized
+}
+
+function Normalize-IdentityValue {
+    param([object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    $normalized = ([string]$Value).Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return $null
     }
 
     return $normalized
@@ -532,12 +557,117 @@ function New-DelegateRecord {
 
 Write-Host "Discovering mailboxes..." -ForegroundColor Cyan
 
-$mailboxes = Invoke-EXOWithRetry -Description "Get-EXOMailbox" -ScriptBlock {
-    Get-EXOMailbox -ResultSize Unlimited `
-        -RecipientTypeDetails $RecipientTypeDetails `
-        -Properties UserPrincipalName, PrimarySmtpAddress, DisplayName,
-    RecipientTypeDetails, ExternalDirectoryObjectId,
-    LegacyExchangeDN, EmailAddresses, GrantSendOnBehalfTo -ErrorAction Stop
+$mailboxes = @()
+
+if ($TestMailboxes.Count -gt 0) {
+    $requestedMailboxKeys = [System.Collections.Generic.List[string]]::new()
+    $requestedMailboxSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($testMailbox in $TestMailboxes) {
+        $normalized = Normalize-IdentityValue -Value $testMailbox
+        if (-not [string]::IsNullOrWhiteSpace($normalized) -and $requestedMailboxSet.Add($normalized)) {
+            $requestedMailboxKeys.Add($normalized) | Out-Null
+        }
+    }
+
+    $resolvedMailboxes = [System.Collections.Generic.List[object]]::new()
+    $selectedMailboxSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $requestedMailboxLookupSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($requestedMailbox in $requestedMailboxKeys) {
+        $requestedMailboxLookupSet.Add($requestedMailbox) | Out-Null
+    }
+
+    $recipientTypeLookupSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($recipientType in $RecipientTypeDetails) {
+        if (-not [string]::IsNullOrWhiteSpace($recipientType)) {
+            $recipientTypeLookupSet.Add($recipientType.Trim()) | Out-Null
+        }
+    }
+
+    $notFoundInputs = [System.Collections.Generic.List[string]]::new()
+    $skippedByRecipientType = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($requestedMailbox in $requestedMailboxKeys) {
+        $matched = $null
+
+        try {
+            $matched = Invoke-EXOWithRetry -Description "Resolve TestMailbox:$requestedMailbox" -ScriptBlock {
+                Get-EXOMailbox -Identity $requestedMailbox -Properties UserPrincipalName, PrimarySmtpAddress, DisplayName,
+                RecipientTypeDetails, ExternalDirectoryObjectId, LegacyExchangeDN, EmailAddresses, GrantSendOnBehalfTo -ErrorAction Stop
+            }
+        }
+        catch {
+            $notFoundInputs.Add($requestedMailbox) | Out-Null
+        }
+
+        if ($null -eq $matched) {
+            continue
+        }
+
+        $matchedRecipientType = [string](Get-OptionalObjectPropertyValue -InputObject $matched -PropertyName 'RecipientTypeDetails')
+        if ($recipientTypeLookupSet.Count -gt 0 -and -not $recipientTypeLookupSet.Contains($matchedRecipientType)) {
+            $skippedByRecipientType.Add("$requestedMailbox ($matchedRecipientType)") | Out-Null
+            continue
+        }
+
+        $dedupeKey = Normalize-IdentityValue -Value (Get-OptionalObjectPropertyValue -InputObject $matched -PropertyName 'ExternalDirectoryObjectId')
+        if ([string]::IsNullOrWhiteSpace($dedupeKey)) {
+            $dedupeKey = Normalize-IdentityValue -Value (Get-OptionalObjectPropertyValue -InputObject $matched -PropertyName 'UserPrincipalName')
+        }
+        if ([string]::IsNullOrWhiteSpace($dedupeKey)) {
+            $dedupeKey = Normalize-IdentityValue -Value (Get-OptionalObjectPropertyValue -InputObject $matched -PropertyName 'PrimarySmtpAddress')
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($dedupeKey) -and $selectedMailboxSet.Add($dedupeKey)) {
+            $resolvedMailboxes.Add($matched) | Out-Null
+        }
+    }
+
+    if ($notFoundInputs.Count -gt 0) {
+        Write-Warning "Test mailbox(es) not found or inaccessible: $($notFoundInputs -join ', ')"
+    }
+
+    if ($skippedByRecipientType.Count -gt 0) {
+        Write-Warning "Test mailbox(es) skipped because RecipientTypeDetails is not in filter ($($RecipientTypeDetails -join ', ')): $($skippedByRecipientType -join ', ')"
+    }
+
+    if ($requestedMailboxLookupSet.Count -gt 0 -and $resolvedMailboxes.Count -lt $requestedMailboxLookupSet.Count) {
+        $resolvedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($resolvedMailbox in $resolvedMailboxes) {
+            foreach ($resolvedKey in @(
+                    (Normalize-IdentityValue -Value (Get-OptionalObjectPropertyValue -InputObject $resolvedMailbox -PropertyName 'UserPrincipalName')),
+                    (Normalize-IdentityValue -Value (Get-OptionalObjectPropertyValue -InputObject $resolvedMailbox -PropertyName 'PrimarySmtpAddress')),
+                    (Normalize-IdentityValue -Value (Get-OptionalObjectPropertyValue -InputObject $resolvedMailbox -PropertyName 'ExternalDirectoryObjectId'))
+                )) {
+                if (-not [string]::IsNullOrWhiteSpace($resolvedKey)) {
+                    $resolvedKeys.Add($resolvedKey) | Out-Null
+                }
+            }
+        }
+
+        $missingRequestedInputs = [System.Collections.Generic.List[string]]::new()
+        foreach ($requestedMailbox in $requestedMailboxKeys) {
+            if (-not $resolvedKeys.Contains($requestedMailbox)) {
+                $missingRequestedInputs.Add($requestedMailbox) | Out-Null
+            }
+        }
+
+        if ($missingRequestedInputs.Count -gt 0) {
+            Write-Host "Some requested test mailbox inputs were deduplicated to the same mailbox or filtered out: $($missingRequestedInputs -join ', ')" -ForegroundColor DarkGray
+        }
+    }
+
+    $mailboxes = @($resolvedMailboxes)
+    Write-Host "TestMailboxes filter active. Processing $($mailboxes.Count) mailbox(es)." -ForegroundColor Yellow
+}
+else {
+    $mailboxes = Invoke-EXOWithRetry -Description "Get-EXOMailbox" -ScriptBlock {
+        Get-EXOMailbox -ResultSize Unlimited `
+            -RecipientTypeDetails $RecipientTypeDetails `
+            -Properties UserPrincipalName, PrimarySmtpAddress, DisplayName,
+        RecipientTypeDetails, ExternalDirectoryObjectId,
+        LegacyExchangeDN, EmailAddresses, GrantSendOnBehalfTo -ErrorAction Stop
+    }
 }
 
 $total = $mailboxes.Count
@@ -550,7 +680,7 @@ if (Test-Path $OutputPath) {
     Write-Host "Attempting to recover and resume..." -ForegroundColor DarkGray
     try {
         # Need to parse json with appropriate depth
-        $existingOutput = Get-Content $OutputPath -Raw | ConvertFrom-Json -Depth 20
+        $existingOutput = Get-Content $OutputPath -Raw | ConvertFrom-Json
         if ($existingOutput.Mailboxes) {
             foreach ($mbx in $existingOutput.Mailboxes) {
                 # Add to exportList
@@ -576,57 +706,62 @@ Write-Host "Found $total mailboxes." -ForegroundColor Green
 # we fetch ALL recipients in one bulk call and cache them by multiple keys.
 # This typically reduces runtime from hours to minutes for large tenants.
 
-Write-Host "Pre-loading recipient directory for fast trustee resolution..." -ForegroundColor Cyan
-$preCacheTimer = [System.Diagnostics.Stopwatch]::StartNew()
-
-try {
-    $allRecipients = Invoke-EXOWithRetry -Description "Get-EXORecipient (bulk pre-cache)" -ScriptBlock {
-        Get-EXORecipient -ResultSize Unlimited `
-            -Properties DisplayName, ExternalDirectoryObjectId, RecipientTypeDetails, PrimarySmtpAddress `
-            -ErrorAction Stop
-    }
-
-    $recipientCount = 0
-    foreach ($r in $allRecipients) {
-        $obj = [ordered]@{
-            PrimarySmtpAddress        = $r.PrimarySmtpAddress
-            DisplayName               = $r.DisplayName
-            ExternalDirectoryObjectId = $r.ExternalDirectoryObjectId
-            RecipientTypeDetails      = $r.RecipientTypeDetails
-        }
-
-        # Cache by PrimarySmtpAddress (most common lookup key for mailbox-level perms)
-        if (-not [string]::IsNullOrWhiteSpace($r.PrimarySmtpAddress)) {
-            $global:IdentityCache[$r.PrimarySmtpAddress] = $obj
-        }
-
-        # Cache by DisplayName (common lookup key for folder-level perms)
-        if (-not [string]::IsNullOrWhiteSpace($r.DisplayName) -and
-            -not $global:IdentityCache.ContainsKey($r.DisplayName)) {
-            $global:IdentityCache[$r.DisplayName] = $obj
-        }
-
-        # Cache by Alias (fallback lookup key)
-        if (-not [string]::IsNullOrWhiteSpace($r.Alias) -and
-            -not $global:IdentityCache.ContainsKey($r.Alias)) {
-            $global:IdentityCache[$r.Alias] = $obj
-        }
-
-        # Cache by Name property (used in some permission entries)
-        if (-not [string]::IsNullOrWhiteSpace($r.Name) -and
-            -not $global:IdentityCache.ContainsKey($r.Name)) {
-            $global:IdentityCache[$r.Name] = $obj
-        }
-
-        $recipientCount++
-    }
-
-    $preCacheTimer.Stop()
-    Write-Host "Cached $($global:IdentityCache.Count) identity keys from $recipientCount recipients in $($preCacheTimer.Elapsed.ToString('mm\:ss'))." -ForegroundColor Green
+if ($TestMailboxes.Count -gt 0) {
+    Write-Host "Skipping recipient directory pre-load because TestMailboxes was provided." -ForegroundColor DarkGray
 }
-catch {
-    $preCacheTimer.Stop()
-    Write-Warning "Could not pre-load recipients ($($preCacheTimer.Elapsed.ToString('mm\:ss'))). Falling back to per-trustee resolution (slower). Error: $_"
+else {
+    Write-Host "Pre-loading recipient directory for fast trustee resolution..." -ForegroundColor Cyan
+    $preCacheTimer = [System.Diagnostics.Stopwatch]::StartNew()
+
+    try {
+        $allRecipients = Invoke-EXOWithRetry -Description "Get-EXORecipient (bulk pre-cache)" -ScriptBlock {
+            Get-EXORecipient -ResultSize Unlimited `
+                -Properties DisplayName, ExternalDirectoryObjectId, RecipientTypeDetails, PrimarySmtpAddress `
+                -ErrorAction Stop
+        }
+
+        $recipientCount = 0
+        foreach ($r in $allRecipients) {
+            $obj = [ordered]@{
+                PrimarySmtpAddress        = $r.PrimarySmtpAddress
+                DisplayName               = $r.DisplayName
+                ExternalDirectoryObjectId = $r.ExternalDirectoryObjectId
+                RecipientTypeDetails      = $r.RecipientTypeDetails
+            }
+
+            # Cache by PrimarySmtpAddress (most common lookup key for mailbox-level perms)
+            if (-not [string]::IsNullOrWhiteSpace($r.PrimarySmtpAddress)) {
+                $global:IdentityCache[$r.PrimarySmtpAddress] = $obj
+            }
+
+            # Cache by DisplayName (common lookup key for folder-level perms)
+            if (-not [string]::IsNullOrWhiteSpace($r.DisplayName) -and
+                -not $global:IdentityCache.ContainsKey($r.DisplayName)) {
+                $global:IdentityCache[$r.DisplayName] = $obj
+            }
+
+            # Cache by Alias (fallback lookup key)
+            if (-not [string]::IsNullOrWhiteSpace($r.Alias) -and
+                -not $global:IdentityCache.ContainsKey($r.Alias)) {
+                $global:IdentityCache[$r.Alias] = $obj
+            }
+
+            # Cache by Name property (used in some permission entries)
+            if (-not [string]::IsNullOrWhiteSpace($r.Name) -and
+                -not $global:IdentityCache.ContainsKey($r.Name)) {
+                $global:IdentityCache[$r.Name] = $obj
+            }
+
+            $recipientCount++
+        }
+
+        $preCacheTimer.Stop()
+        Write-Host "Cached $($global:IdentityCache.Count) identity keys from $recipientCount recipients in $($preCacheTimer.Elapsed.ToString('mm\:ss'))." -ForegroundColor Green
+    }
+    catch {
+        $preCacheTimer.Stop()
+        Write-Warning "Could not pre-load recipients ($($preCacheTimer.Elapsed.ToString('mm\:ss'))). Falling back to per-trustee resolution (slower). Error: $_"
+    }
 }
 
 Write-Host "Starting extraction...`n" -ForegroundColor Cyan
@@ -903,6 +1038,7 @@ foreach ($mbx in $mailboxes) {
                     TotalFolderErrors          = $global:FolderErrors
                     RecipientTypesIncluded     = $RecipientTypeDetails
                     IncludedFolders            = $IncludedFolders
+                    TestMailboxesIncluded      = $TestMailboxes
                     FolderPermissionsCollected = (-not $SkipFolderPermissions)
                     IsPartial                  = ($exportList.Count -lt $total)
                 }
@@ -942,6 +1078,7 @@ $output = [ordered]@{
         TotalFolderErrors          = $global:FolderErrors
         RecipientTypesIncluded     = $RecipientTypeDetails
         IncludedFolders            = $IncludedFolders
+        TestMailboxesIncluded      = $TestMailboxes
         FolderPermissionsCollected = (-not $SkipFolderPermissions)
     }
     Mailboxes      = $exportList
@@ -970,6 +1107,7 @@ Write-Host "Mailboxes processed  : $total"
 Write-Host "Identity cache size  : $($global:IdentityCache.Count) unique identity keys cached"
 Write-Host "Resolve errors       : $global:ResolveErrors (logged as Unresolvable)"
 Write-Host "Folder errors        : $global:FolderErrors (suppressed)"
+Write-Host "Test mailbox mode    : $(if ($TestMailboxes.Count -gt 0) { $TestMailboxes -join ', ' } else { 'Disabled (all discovered mailboxes)' })"
 Write-Host "Total elapsed time   : $($global:sw.Elapsed.ToString('hh\:mm\:ss'))"
 Write-Host "Avg per mailbox      : $([math]::Round($global:sw.Elapsed.TotalSeconds / [math]::Max($total, 1), 1))s"
 Write-Host "Output file          : $OutputPath"

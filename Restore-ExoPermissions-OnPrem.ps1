@@ -1,8 +1,8 @@
 # ==============================================================================
-# Script  : Restore-ExoPermissions.ps1
-# Version : 1.2
-# Purpose : Restore mailbox-level and folder-level Exchange Online permissions
-#           on a TARGET tenant using the JSON export produced by
+# Script  : Restore-ExoPermissions-OnPrem.ps1
+# Version : 1.0
+# Purpose : Restore mailbox-level and folder-level permissions on Exchange
+#           On-Premises using the JSON export produced by
 #           Export-ExoPermissions-HybridReady.ps1 and a UPN mapping CSV.
 #
 # Permission types restored:
@@ -20,10 +20,13 @@
 #   -WhatIf      : Simulate all actions, no changes made
 #   -SkipExisting: Skip permissions that already exist (default: true)
 #   -PermTypes   : Limit to specific permission types
-#   -UseEnvCredentials: Use .env app-only authentication instead of interactive sign-in
+#
+# Authentication model:
+#   - No .env or app auth is required.
+#   - If Exchange cmdlets are already loaded (Exchange Management Shell), the
+#     script reuses that session and does not require server/URI parameters.
+#   - Otherwise, it can open a remote PowerShell session using Kerberos.
 # ==============================================================================
-
-#Requires -Modules ExchangeOnlineManagement
 
 [CmdletBinding(SupportsShouldProcess)]
 param (
@@ -37,6 +40,22 @@ param (
     [ValidateScript({ Test-Path $_ -PathType Leaf })]
     [string]$MappingCsvPath,
 
+    # Optional Exchange On-Prem endpoint host (for example: ex01.contoso.local).
+    # Only needed when this script must create a remote session itself.
+    [string]$ExchangeServer = "",
+
+    # Optional remote PowerShell URI override.
+    # If omitted and a remote session is required, defaults to
+    # http(s)://<ExchangeServer>/PowerShell/
+    [string]$ConnectionUri = "",
+
+    # Use this switch if the endpoint requires HTTPS.
+    [switch]$UseHttps,
+
+    # Optional explicit credential for remote session.
+    # If omitted, current Windows credentials are used.
+    [pscredential]$Credential,
+
     # Limit which permission types to restore
     [ValidateSet("X500Addresses", "FullAccess", "SendAs", "SendOnBehalf", "FolderPermissions", "All")]
     [string[]]$PermTypes = @("All"),
@@ -44,10 +63,10 @@ param (
     # Skip adding a permission if it already exists on the target mailbox
     [bool]$SkipExisting = $true,
 
-    # How long to sleep between mailboxes to avoid throttling (ms)
+    # How long to sleep between mailboxes (ms)
     [int]$ThrottleDelayMs = 200,
 
-    # Max retries for throttled calls
+    # Max retries for transient failures
     [int]$MaxRetries = 3,
 
     # Where to write the restore log (CSV). Defaults to same dir as this script.
@@ -55,13 +74,7 @@ param (
 
     # Optional: only restore for the specified mailbox email addresses.
     # Matches source UPN, source primary SMTP, or mapped target UPN.
-    [string[]]$TestMailboxes = @(),
-
-    # Use tenant/app credentials from the .env file instead of interactive sign-in.
-    [switch]$UseEnvCredentials,
-
-    # Optional path to the .env file. Defaults to .env in the script directory.
-    [string]$EnvFilePath = ""
+    [string[]]$TestMailboxes = @()
 )
 
 Set-StrictMode -Version Latest
@@ -73,18 +86,8 @@ $ErrorActionPreference = "Continue"
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
-if ([string]::IsNullOrWhiteSpace($EnvFilePath)) {
-    $EnvFilePath = Join-Path $scriptDir ".env"
-}
-
-# Convenience behavior: if the caller explicitly passed EnvFilePath, prefer app-only auth.
-if (-not $UseEnvCredentials -and $PSBoundParameters.ContainsKey('EnvFilePath')) {
-    $UseEnvCredentials = $true
-    Write-Host "EnvFilePath was provided explicitly. Enabling app-only authentication." -ForegroundColor Yellow
-}
-
 if ([string]::IsNullOrWhiteSpace($LogPath)) {
-    $LogPath = Join-Path $scriptDir "RestoreLog_$(Get-Date -Format 'yyyyMMdd_HHmm').csv"
+    $LogPath = Join-Path $scriptDir "RestoreLog_OnPrem_$(Get-Date -Format 'yyyyMMdd_HHmm').csv"
 }
 
 # Restore log — every action taken or skipped is written here
@@ -126,10 +129,10 @@ function Write-LogEntry {
 # SECTION 1 — Helpers
 # ==============================================================================
 
-function Invoke-EXOWithRetry {
+function Invoke-ExchangeWithRetry {
     param(
         [scriptblock]$ScriptBlock,
-        [string]$Description = "EXO call",
+        [string]$Description = "Exchange call",
         [int]$MaxAttempts = $MaxRetries
     )
     $attempt = 0
@@ -140,9 +143,9 @@ function Invoke-EXOWithRetry {
         }
         catch {
             $msg = $_.Exception.Message
-            if ($msg -match "throttl|429|ServiceUnavailable|TooManyRequests" -and $attempt -lt $MaxAttempts) {
+            if ($msg -match "temporar|timeout|busy|service unavailable|transient" -and $attempt -lt $MaxAttempts) {
                 $wait = [math]::Pow(2, $attempt) * 1000
-                Write-Warning "Throttled on '$Description' — retrying in $($wait/1000)s (attempt $attempt/$MaxAttempts)"
+                Write-Warning "Transient failure on '$Description' — retrying in $($wait/1000)s (attempt $attempt/$MaxAttempts)"
                 Start-Sleep -Milliseconds $wait
             }
             else { throw }
@@ -150,77 +153,32 @@ function Invoke-EXOWithRetry {
     } while ($attempt -lt $MaxAttempts)
 }
 
-function Get-EnvVariables {
-    param([string]$Path)
-
-    if (-not (Test-Path -Path $Path)) {
-        throw ".env file not found at: $Path"
-    }
-
-    $envVars = @{}
-    Get-Content -Path $Path | ForEach-Object {
-        if ($_ -match '^\s*([^#][^=]+)\s*=\s*(.+)\s*$') {
-            $key = $matches[1].Trim()
-            $value = $matches[2].Trim()
-            $value = $value -replace '^["'']|["'']$', ''
-            $envVars[$key] = $value
-        }
-    }
-
-    return $envVars
-}
-
-function Connect-ExchangeOnlineSession {
+function Connect-ExchangeOnPremSession {
     param(
-        [switch]$UseEnvCredentials,
-        [string]$EnvFilePath
+        [string]$ConnectionUri,
+        [pscredential]$Credential
     )
 
-    if (-not $UseEnvCredentials) {
-        Write-Host "Connecting to Exchange Online using interactive sign-in..." -ForegroundColor Cyan
-        Connect-ExchangeOnline -ShowBanner:$false
-        return
+    Write-Host "Connecting to Exchange On-Prem remote PowerShell..." -ForegroundColor Cyan
+    Write-Host "Connection URI: $ConnectionUri" -ForegroundColor DarkGray
+
+    $newSessionParams = @{
+        ConfigurationName = 'Microsoft.Exchange'
+        ConnectionUri     = $ConnectionUri
+        Authentication    = 'Kerberos'
+        ErrorAction       = 'Stop'
     }
 
-    Write-Host "Loading Exchange Online app credentials from .env..." -ForegroundColor Cyan
-    $envVars = Get-EnvVariables -Path $EnvFilePath
-
-    $tenantId = $envVars["TENANT_ID"]
-    $clientId = $envVars["CLIENT_ID"]
-    $clientSecret = $envVars["CLIENT_SECRET"]
-    $organizationName = $envVars["ORGANIZATION"]
-
-    if (-not $tenantId -or -not $clientId -or -not $clientSecret) {
-        throw "Missing required environment variables: TENANT_ID, CLIENT_ID, CLIENT_SECRET"
+    if ($null -ne $Credential) {
+        $newSessionParams.Credential = $Credential
     }
 
-    if (-not $organizationName) {
-        Write-Warning "ORGANIZATION not set in .env file. Attempting connection without it."
-    }
+    $script:ExchangeSession = New-PSSession @newSessionParams
+    Import-PSSession -Session $script:ExchangeSession -DisableNameChecking -AllowClobber | Out-Null
+}
 
-    $tokenUrl = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
-    $body = @{
-        client_id     = $clientId
-        client_secret = $clientSecret
-        scope         = "https://outlook.office365.com/.default"
-        grant_type    = "client_credentials"
-    }
-
-    Write-Host "Acquiring Exchange Online access token..." -ForegroundColor DarkGray
-    $tokenResponse = Invoke-RestMethod -Method Post -Uri $tokenUrl -Body $body -ContentType "application/x-www-form-urlencoded"
-    $accessToken = $tokenResponse.access_token
-
-    $connectParams = @{
-        AccessToken = $accessToken
-        ShowBanner  = $false
-    }
-
-    if ($organizationName) {
-        $connectParams.Organization = $organizationName
-    }
-
-    Write-Host "Connecting to Exchange Online using app-only authentication..." -ForegroundColor Cyan
-    Connect-ExchangeOnline @connectParams
+function Test-ExchangeCmdletsAvailable {
+    return [bool](Get-Command -Name Get-Mailbox -ErrorAction SilentlyContinue)
 }
 
 # Resolve a SourceUPN to a TargetUPN via the mapping table
@@ -229,7 +187,7 @@ function Resolve-TargetUPN {
     if ([string]::IsNullOrWhiteSpace($SourceUPN)) { return $null }
     $key = $SourceUPN.ToLower()
     if ($Mapping.ContainsKey($key)) { return $Mapping[$key] }
-    return $null  # not in scope of migration
+    return $null
 }
 
 # Check if a ShouldProcess permission type is requested
@@ -304,19 +262,21 @@ function Get-ExportX500Addresses {
     return @($x500Addresses | Sort-Object)
 }
 
+
 # ==============================================================================
 # SECTION 2 — Load inputs
 # ==============================================================================
 
-Write-Host "`n=== EXO Permission Restore v1.2 ===" -ForegroundColor Cyan
-Write-Host "Export JSON : $ExportJsonPath"
-Write-Host "Mapping CSV : $MappingCsvPath"
-Write-Host "Log Output  : $LogPath"
-Write-Host "WhatIf Mode : $WhatIfPreference"
-Write-Host "PermTypes   : $($PermTypes -join ', ')"
-Write-Host "Test scope  : $(if ($TestMailboxes.Count -gt 0) { $TestMailboxes -join ', ' } else { 'Disabled (all exported mailboxes)' })"
-Write-Host "Auth Mode   : $(if ($UseEnvCredentials) { '.env app-only' } else { 'Interactive' })"
-Write-Host "Started     : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n"
+Write-Host "`n=== Exchange On-Prem Permission Restore v1.0 ===" -ForegroundColor Cyan
+Write-Host "Export JSON    : $ExportJsonPath"
+Write-Host "Mapping CSV    : $MappingCsvPath"
+Write-Host "Exchange Server: $(if ([string]::IsNullOrWhiteSpace($ExchangeServer)) { '(not specified)' } else { $ExchangeServer })"
+Write-Host "Connection URI : $(if ([string]::IsNullOrWhiteSpace($ConnectionUri)) { '(auto when remote session is needed)' } else { $ConnectionUri })"
+Write-Host "Log Output     : $LogPath"
+Write-Host "WhatIf Mode    : $WhatIfPreference"
+Write-Host "PermTypes      : $($PermTypes -join ', ')"
+Write-Host "Test scope     : $(if ($TestMailboxes.Count -gt 0) { $TestMailboxes -join ', ' } else { 'Disabled (all exported mailboxes)' })"
+Write-Host "Started        : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n"
 
 # --- Load UPN mapping ---
 Write-Host "Loading UPN mapping..." -ForegroundColor Cyan
@@ -378,14 +338,31 @@ $mbxCount = 0
 
 Write-Host "Found $totalMbx mailboxes in export.`n" -ForegroundColor Green
 
-# --- Connect to TARGET tenant ---
-Write-Host "Connecting to Exchange Online (TARGET tenant)..." -ForegroundColor Cyan
-try {
-    Connect-ExchangeOnlineSession -UseEnvCredentials:$UseEnvCredentials -EnvFilePath $EnvFilePath
+# --- Connect to target Exchange On-Prem ---
+$script:ExchangeSession = $null
+
+if (Test-ExchangeCmdletsAvailable) {
+    Write-Host "Detected Exchange cmdlets in current shell. Reusing existing Exchange session." -ForegroundColor Green
 }
-catch {
-    Write-Error "Failed to connect to Exchange Online: $_"
-    exit 1
+else {
+    if ([string]::IsNullOrWhiteSpace($ConnectionUri)) {
+        if ([string]::IsNullOrWhiteSpace($ExchangeServer)) {
+            Write-Error "Exchange cmdlets are not available in current shell. Provide -ExchangeServer or -ConnectionUri so the script can open a remote Exchange session."
+            exit 1
+        }
+
+        $scheme = if ($UseHttps) { "https" } else { "http" }
+        $ConnectionUri = "${scheme}://$ExchangeServer/PowerShell/"
+        Write-Host "Using remote Connection URI: $ConnectionUri" -ForegroundColor DarkGray
+    }
+
+    try {
+        Connect-ExchangeOnPremSession -ConnectionUri $ConnectionUri -Credential $Credential
+    }
+    catch {
+        Write-Error "Failed to connect to Exchange On-Prem: $_"
+        exit 1
+    }
 }
 
 # ==============================================================================
@@ -412,8 +389,8 @@ function Get-ExistingMailboxPerms {
 
     try {
         $perms.FullAccess = @(
-            Invoke-EXOWithRetry -Description "ExistingFA:$TargetUPN" -ScriptBlock {
-                Get-EXOMailboxPermission -Identity $TargetUPN -ErrorAction Stop |
+            Invoke-ExchangeWithRetry -Description "ExistingFA:$TargetUPN" -ScriptBlock {
+                Get-MailboxPermission -Identity $TargetUPN -ErrorAction Stop |
                 Where-Object { $_.IsInherited -eq $false } |
                 Select-Object -ExpandProperty User
             }
@@ -423,8 +400,8 @@ function Get-ExistingMailboxPerms {
 
     try {
         $perms.SendAs = @(
-            Invoke-EXOWithRetry -Description "ExistingSA:$TargetUPN" -ScriptBlock {
-                Get-EXORecipientPermission -Identity $TargetUPN -ErrorAction Stop |
+            Invoke-ExchangeWithRetry -Description "ExistingSA:$TargetUPN" -ScriptBlock {
+                Get-RecipientPermission -Identity $TargetUPN -ErrorAction Stop |
                 Where-Object { $_.IsInherited -eq $false } |
                 Select-Object -ExpandProperty Trustee
             }
@@ -433,8 +410,8 @@ function Get-ExistingMailboxPerms {
     catch { Write-Verbose "Could not pre-cache SendAs for $TargetUPN" }
 
     try {
-        $mbxObj = Invoke-EXOWithRetry -Description "ExistingSOB:$TargetUPN" -ScriptBlock {
-            Get-EXOMailbox -Identity $TargetUPN -Properties GrantSendOnBehalfTo, EmailAddresses -ErrorAction Stop
+        $mbxObj = Invoke-ExchangeWithRetry -Description "ExistingSOB:$TargetUPN" -ScriptBlock {
+            Get-Mailbox -Identity $TargetUPN -ErrorAction Stop
         }
         $perms.SendOnBehalf = @($mbxObj.GrantSendOnBehalfTo)
 
@@ -451,7 +428,7 @@ function Get-ExistingMailboxPerms {
         }
         $perms.X500Addresses = @($existingX500 | Sort-Object)
     }
-    catch { Write-Verbose "Could not pre-cache SendOnBehalf for $TargetUPN" }
+    catch { Write-Verbose "Could not pre-cache SendOnBehalf/X500 for $TargetUPN" }
 
     $targetPermCache[$TargetUPN] = $perms
     return $perms
@@ -467,7 +444,7 @@ foreach ($mbxRecord in $mailboxes) {
     $tgtUPN = Resolve-TargetUPN -SourceUPN $srcUPN -Mapping $upnMap
 
     $pct = if ($totalMbx -gt 0) { [int](($mbxCount / $totalMbx) * 100) } else { 0 }
-    Write-Progress -Activity "Restoring EXO Permissions" `
+    Write-Progress -Activity "Restoring Exchange On-Prem Permissions" `
         -Status "[$mbxCount/$totalMbx] $srcUPN -> $(if ($tgtUPN) { $tgtUPN } else { 'NOT IN MAPPING' })" `
         -PercentComplete $pct
 
@@ -510,7 +487,7 @@ foreach ($mbxRecord in $mailboxes) {
             }
             elseif ($PSCmdlet.ShouldProcess($tgtUPN, "Add $($x500ToAdd.Count) X500 alias(es)")) {
                 try {
-                    Invoke-EXOWithRetry -Description "AddX500:$tgtUPN" -ScriptBlock {
+                    Invoke-ExchangeWithRetry -Description "AddX500:$tgtUPN" -ScriptBlock {
                         Set-Mailbox -Identity $tgtUPN `
                             -EmailAddresses @{ Add = $x500ToAdd.ToArray() } `
                             -ErrorAction Stop
@@ -562,7 +539,7 @@ foreach ($mbxRecord in $mailboxes) {
 
             if ($PSCmdlet.ShouldProcess($tgtUPN, "Add FullAccess for $delTgtUPN")) {
                 try {
-                    Invoke-EXOWithRetry -Description "AddFA:$tgtUPN->$delTgtUPN" -ScriptBlock {
+                    Invoke-ExchangeWithRetry -Description "AddFA:$tgtUPN->$delTgtUPN" -ScriptBlock {
                         $addPermissionParams = @{
                             Identity     = $tgtUPN
                             User         = $delTgtUPN
@@ -618,7 +595,7 @@ foreach ($mbxRecord in $mailboxes) {
 
             if ($PSCmdlet.ShouldProcess($tgtUPN, "Add SendAs for $delTgtUPN")) {
                 try {
-                    Invoke-EXOWithRetry -Description "AddSA:$tgtUPN->$delTgtUPN" -ScriptBlock {
+                    Invoke-ExchangeWithRetry -Description "AddSA:$tgtUPN->$delTgtUPN" -ScriptBlock {
                         Add-RecipientPermission -Identity $tgtUPN `
                             -Trustee $delTgtUPN `
                             -AccessRights SendAs `
@@ -644,7 +621,6 @@ foreach ($mbxRecord in $mailboxes) {
         $existingSOBSet = [System.Collections.Generic.HashSet[string]]::new(
             [System.StringComparer]::OrdinalIgnoreCase)
 
-        # Collect already-existing Send on Behalf trustees on target (to merge, not overwrite)
         if ($SkipExisting) {
             foreach ($existingSOB in $existing.SendOnBehalf) {
                 if (-not [string]::IsNullOrWhiteSpace($existingSOB)) {
@@ -682,11 +658,10 @@ foreach ($mbxRecord in $mailboxes) {
             $sobNewDelegates.Add($delTgtUPN)
         }
 
-        # Set-Mailbox takes the FULL list — apply once after collecting all trustees
         if ($sobNewDelegates.Count -gt 0) {
             if ($PSCmdlet.ShouldProcess($tgtUPN, "Set SendOnBehalf for $($sobNewDelegates -join ', ')")) {
                 try {
-                    Invoke-EXOWithRetry -Description "SetSOB:$tgtUPN" -ScriptBlock {
+                    Invoke-ExchangeWithRetry -Description "SetSOB:$tgtUPN" -ScriptBlock {
                         Set-Mailbox -Identity $tgtUPN `
                             -GrantSendOnBehalfTo $sobTargetList.ToArray() `
                             -ErrorAction Stop
@@ -714,16 +689,15 @@ foreach ($mbxRecord in $mailboxes) {
     # ─── D. FOLDER PERMISSIONS ────────────────────────────────────────────────
     if (Test-PermTypeRequested "FolderPermissions") {
         foreach ($folderRecord in $mbxRecord.FolderPermissions) {
-            $rawFolderPath = $folderRecord.FolderPath   # e.g. \Inbox
+            $rawFolderPath = $folderRecord.FolderPath
             $folderIdentity = "$($tgtUPN):$rawFolderPath"
 
-            # Pre-load existing folder permissions for this specific folder
             $existingFolderPerms = @()
             if ($SkipExisting) {
                 try {
                     $existingFolderPerms = @(
-                        Invoke-EXOWithRetry -Description "ExistingFolderPerms:$folderIdentity" -ScriptBlock {
-                            Get-EXOMailboxFolderPermission -Identity $folderIdentity -ErrorAction Stop
+                        Invoke-ExchangeWithRetry -Description "ExistingFolderPerms:$folderIdentity" -ScriptBlock {
+                            Get-MailboxFolderPermission -Identity $folderIdentity -ErrorAction Stop
                         }
                     )
                 }
@@ -733,7 +707,6 @@ foreach ($mbxRecord in $mailboxes) {
             }
 
             foreach ($fp in $folderRecord.Permissions) {
-                # Skip Default/Anonymous unless they carry meaningful rights
                 $isWellKnown = $fp.PermissionStatus -eq "WellKnown"
 
                 if ($fp.PermissionStatus -ne "Resolved" -and -not $isWellKnown) {
@@ -743,8 +716,7 @@ foreach ($mbxRecord in $mailboxes) {
                     continue
                 }
 
-                # Map folder delegate to target
-                $delTgtUPN = $fp.DelegateUPN  # Default / Anonymous kept as-is
+                $delTgtUPN = $fp.DelegateUPN
 
                 if (-not $isWellKnown) {
                     $delTgtUPN = Resolve-TargetUPN -SourceUPN $fp.DelegateUPN -Mapping $upnMap
@@ -756,10 +728,8 @@ foreach ($mbxRecord in $mailboxes) {
                     }
                 }
 
-                # Normalize AccessRights — comes from JSON as array or string
                 $accessRights = if ($fp.AccessRights -is [array]) { $fp.AccessRights } else { @($fp.AccessRights) }
 
-                # Check if this delegate already has a permission on this folder
                 $existingEntry = $existingFolderPerms | Where-Object {
                     ([string]$_.User) -ieq $delTgtUPN
                 }
@@ -773,8 +743,8 @@ foreach ($mbxRecord in $mailboxes) {
                                     -Status "Skipped" -Message "Permission already exists on target — use Set-MailboxFolderPermission to update"
                                 continue
                             }
-                            # Update existing permission
-                            Invoke-EXOWithRetry -Description "SetFP:$folderIdentity->$delTgtUPN" -ScriptBlock {
+
+                            Invoke-ExchangeWithRetry -Description "SetFP:$folderIdentity->$delTgtUPN" -ScriptBlock {
                                 Set-MailboxFolderPermission -Identity $folderIdentity `
                                     -User $delTgtUPN `
                                     -AccessRights $accessRights `
@@ -782,8 +752,7 @@ foreach ($mbxRecord in $mailboxes) {
                             }
                         }
                         else {
-                            # Add new permission
-                            Invoke-EXOWithRetry -Description "AddFP:$folderIdentity->$delTgtUPN" -ScriptBlock {
+                            Invoke-ExchangeWithRetry -Description "AddFP:$folderIdentity->$delTgtUPN" -ScriptBlock {
                                 Add-MailboxFolderPermission -Identity $folderIdentity `
                                     -User $delTgtUPN `
                                     -AccessRights $accessRights `
@@ -807,20 +776,18 @@ foreach ($mbxRecord in $mailboxes) {
         }
     }
 
-    # Light throttle between mailboxes
     if ($ThrottleDelayMs -gt 0) {
         Start-Sleep -Milliseconds $ThrottleDelayMs
     }
 }
 
-Write-Progress -Activity "Restoring EXO Permissions" -Completed
+Write-Progress -Activity "Restoring Exchange On-Prem Permissions" -Completed
 
 # ==============================================================================
 # SECTION 5 — Write restore log
 # ==============================================================================
 
 Write-Host "`nWriting restore log to: $LogPath" -ForegroundColor Cyan
-
 $restoreLog | Export-Csv -Path $LogPath -NoTypeInformation -Encoding utf8 -Force
 
 # ==============================================================================
@@ -850,4 +817,6 @@ if ($errors -gt 0) {
     Format-Table TargetMailbox, PermType, Delegate, Detail, Message -AutoSize -Wrap
 }
 
-Disconnect-ExchangeOnline -Confirm:$false
+if ($null -ne $script:ExchangeSession) {
+    Remove-PSSession -Session $script:ExchangeSession -ErrorAction SilentlyContinue
+}
