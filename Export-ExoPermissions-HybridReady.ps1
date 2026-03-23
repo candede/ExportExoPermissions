@@ -572,10 +572,6 @@ if ($TestMailboxes.Count -gt 0) {
 
     $resolvedMailboxes = [System.Collections.Generic.List[object]]::new()
     $selectedMailboxSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $requestedMailboxLookupSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($requestedMailbox in $requestedMailboxKeys) {
-        $requestedMailboxLookupSet.Add($requestedMailbox) | Out-Null
-    }
 
     $recipientTypeLookupSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($recipientType in $RecipientTypeDetails) {
@@ -631,7 +627,7 @@ if ($TestMailboxes.Count -gt 0) {
         Write-Warning "Test mailbox(es) skipped because RecipientTypeDetails is not in filter ($($RecipientTypeDetails -join ', ')): $($skippedByRecipientType -join ', ')"
     }
 
-    if ($requestedMailboxLookupSet.Count -gt 0 -and $resolvedMailboxes.Count -lt $requestedMailboxLookupSet.Count) {
+    if ($requestedMailboxSet.Count -gt 0 -and $resolvedMailboxes.Count -lt $requestedMailboxSet.Count) {
         $resolvedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($resolvedMailbox in $resolvedMailboxes) {
             foreach ($resolvedKey in @(
@@ -775,8 +771,7 @@ $processedThisRun = 0
 foreach ($mbx in $mailboxes) {
     $count++
     $pct = [int](($count / $total) * 100)
-    $x500Addresses = @(Get-X500ProxyAddresses -Mailbox $mbx)
-    
+
     # Check if mailbox was already processed in a previous run
     if ($processedUPNs.Contains($mbx.UserPrincipalName)) {
         Write-Progress -Id 0 -Activity "Extracting EXO Permissions" `
@@ -787,6 +782,7 @@ foreach ($mbx in $mailboxes) {
 
     $processedThisRun++
     $mbxSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $x500Addresses = @(Get-X500ProxyAddresses -Mailbox $mbx)
 
     # Calculate ETA based on average processing speed so far
     $elapsed = $global:sw.Elapsed

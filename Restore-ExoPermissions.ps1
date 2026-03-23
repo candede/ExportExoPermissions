@@ -538,9 +538,9 @@ foreach ($mbxRecord in $mailboxes) {
         foreach ($fa in $mbxRecord.MailboxDelegations.FullAccess) {
             $autoMapping = Get-OptionalObjectPropertyValue -InputObject $fa -PropertyName 'AutoMapping'
 
-            if ($fa.PermissionStatus -ne "Resolved") {
+            if ($fa.PermissionStatus -ne "Resolved" -and $fa.PermissionStatus -ne "WellKnown") {
                 Write-LogEntry -TargetMailbox $tgtUPN -PermType "FullAccess" `
-                    -Delegate $fa.RawTrusteeValue -Detail "AutoMapping=$autoMapping" `
+                    -Delegate $fa.DelegateUPN -Detail "AutoMapping=$autoMapping" `
                     -Status "Skipped" -Message "PermissionStatus=$($fa.PermissionStatus) — delegate not resolvable at export time"
                 continue
             }
@@ -595,9 +595,9 @@ foreach ($mbxRecord in $mailboxes) {
     # ─── B. SEND AS ───────────────────────────────────────────────────────────
     if (Test-PermTypeRequested "SendAs") {
         foreach ($sa in $mbxRecord.MailboxDelegations.SendAs) {
-            if ($sa.PermissionStatus -ne "Resolved") {
+            if ($sa.PermissionStatus -ne "Resolved" -and $sa.PermissionStatus -ne "WellKnown") {
                 Write-LogEntry -TargetMailbox $tgtUPN -PermType "SendAs" `
-                    -Delegate $sa.RawTrusteeValue -Detail "-" `
+                    -Delegate $sa.DelegateUPN -Detail "-" `
                     -Status "Skipped" -Message "PermissionStatus=$($sa.PermissionStatus)"
                 continue
             }
@@ -657,9 +657,9 @@ foreach ($mbxRecord in $mailboxes) {
         $sobNewDelegates = [System.Collections.Generic.List[string]]::new()
 
         foreach ($sob in $mbxRecord.MailboxDelegations.SendOnBehalf) {
-            if ($sob.PermissionStatus -ne "Resolved") {
+            if ($sob.PermissionStatus -ne "Resolved" -and $sob.PermissionStatus -ne "WellKnown") {
                 Write-LogEntry -TargetMailbox $tgtUPN -PermType "SendOnBehalf" `
-                    -Delegate $sob.RawTrusteeValue -Detail "-" `
+                    -Delegate $sob.DelegateUPN -Detail "-" `
                     -Status "Skipped" -Message "PermissionStatus=$($sob.PermissionStatus)"
                 continue
             }
@@ -738,7 +738,7 @@ foreach ($mbxRecord in $mailboxes) {
 
                 if ($fp.PermissionStatus -ne "Resolved" -and -not $isWellKnown) {
                     Write-LogEntry -TargetMailbox $tgtUPN -PermType "FolderPermission" `
-                        -Delegate $fp.RawTrusteeValue -Detail $rawFolderPath `
+                        -Delegate $fp.DelegateUPN -Detail $rawFolderPath `
                         -Status "Skipped" -Message "PermissionStatus=$($fp.PermissionStatus)"
                     continue
                 }
